@@ -27,3 +27,7 @@
 1. architect 验收后推送，打 tag 0.2.0 触发 release。
 2. 用 BRAT 在 iPhone / iPad / Mac 装上，真机验证：光标在行内、列表选行、其他想说的、无编号行；多选相册；从「文件」选 xlsx；选择框取消后文字还在。
 3. 若 iOS 窗口里按钮不弹选择框：改成让 input 覆盖在按钮上（label 包 input），直接点 input 本身。
+
+## 发布方式（2026-11-24 约 23:30 北京时间）
+GitHub Actions 上 npm ci 反复崩（npm 自身报错 "Exit handler never called"），去掉了自动发布。改成本机发布：
+改 manifest.json / package.json / versions.json 的版本号 → npm test && npm run build → 提交 → git tag <版本> && git push github <版本> → gh release create <版本> main.js manifest.json --title <版本>
