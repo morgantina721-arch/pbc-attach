@@ -1,7 +1,7 @@
 {
   "id": "pbc-attach",
   "name": "PBC 交资料",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "minAppVersion": "1.4.0",
   "description": "把截图和文件一步交到 PBC 清单的「我的反馈」格子里，手机上也好用。",
   "author": "morgantina721-arch",
