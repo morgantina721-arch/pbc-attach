@@ -66,7 +66,8 @@ export default class PbcAttachPlugin extends Plugin {
     input.type = "file";
     input.multiple = true;
     input.accept = ACCEPT;
-    input.style.display = "none";
+    // 不用 display:none：有些 iOS 版本对隐藏到 display:none 的 input 不弹选择框
+    input.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;";
     document.body.appendChild(input);
     this.input = input;
     const done = () => {
