@@ -1,0 +1,20 @@
+{
+  "name": "pbc-attach",
+  "version": "0.1.0",
+  "description": "PBC 交资料：把截图和文件交到 PBC 清单的「我的反馈」格子里",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "build": "tsc -noEmit -skipLibCheck && node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "test": "esbuild test/pbc.test.ts --bundle --platform=node --format=esm --outfile=.test-build/pbc.test.mjs --log-level=warning && node --test .test-build/pbc.test.mjs"
+  },
+  "license": "MIT",
+  "author": "morgantina721-arch",
+  "devDependencies": {
+    "@types/node": "^26.6.6",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.14.4",
+    "typescript": "^7.0.2"
+  }
+}
