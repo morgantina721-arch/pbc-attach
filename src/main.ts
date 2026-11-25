@@ -2,6 +2,7 @@ import { App, MarkdownView, Notice, Modal, Plugin, PluginSettingTab, Setting, Su
 import {
   parseRows, findRowAtLine, appendToCell, appendToLooseLine, appendToOther, composeCell, composeOther, hasOtherSection, isPbcPagePath, sanitizeFileName, imageName, uniqueName,
   beijingStamp, embedFor, isImageFile, summarize,
+  isUsedRow, splitPieces, joinPieces, removePiece, unescapeCellText, escapeCellText, replaceCell, Piece, Row,
 } from "./pbc";
 
 interface Settings {
@@ -12,11 +13,26 @@ const DEFAULTS: Settings = { pbcFolder: "财务/PBC", attachFolder: "财务/PBC/
 
 const ACCEPT = "image/*,.xlsx,.xls,.csv,.zip,.pdf";
 
-/** 要交到哪：编号行 / 「其他想说的」小节 / 没编号的行（光标停在上面时） */
+/**
+ * 要交到哪：编号行 / 「其他想说的」小节 / 没编号的行（光标停在上面时）
+ * feedback：打开窗口那一刻「我的反馈」格的原文（改原来的时用来核对期间有没有被别处改过）
+ * used：这一行已经用上了（备注 ✅），不让改
+ */
 type Target =
-  | { kind: "row"; id: string; title: string }
+  | { kind: "row"; id: string; title: string; feedback: string; used: boolean }
   | { kind: "other"; id: ""; title: string }
-  | { kind: "loose"; id: ""; title: string; raw: string }; // raw：打开窗口那一刻这一行的原文，写回时靠它定位
+  | { kind: "loose"; id: ""; title: string; raw: string; feedback: string; used: boolean }; // raw：打开窗口那一刻这一行的原文，写回时靠它定位
+
+/** 编号行 → Target */
+const rowTarget = (r: Row): Target => ({ kind: "row", id: r.id, title: r.id + " " + r.desc, feedback: r.feedback, used: isUsedRow(r) });
+
+/** 修改窗口交回来的结果：每一块要么保留（文字可能改过）、要么删掉、要么（图片）换成新选的 */
+interface EditResult {
+  pieces: Piece[]; // 打开时拆出来的原样
+  texts: Map<number, string>; // 改过的话：块序号 → 输入框里的新字（未转义）
+  removed: Set<number>; // 要删掉的块
+  replaced: Map<number, File>; // 要换的图：块序号 → 新选的图片
+}
 
 export default class PbcAttachPlugin extends Plugin {
   settings: Settings = { ...DEFAULTS };
@@ -45,19 +61,22 @@ export default class PbcAttachPlugin extends Plugin {
     const { rows, duplicates, loose } = parseRows(text);
     const other = hasOtherSection(text);
     const cursorLine = view.editor.getCursor().line;
-    const open = (t: Target) => new PostModal(this.app, t, (words, files) => void this.save(file, t, words, files)).open();
+    const open = (t: Target) =>
+      new PostModal(this.app, t, (words, files) => void this.save(file, t, words, files), () =>
+        new EditModal(this.app, t, this.resourceFor(file), (res) => void this.saveEdit(file, t, res)).open(),
+      ).open();
 
     // 光标就在某一行上：跳过选行，直接弹写字窗口
     const cur = findRowAtLine(rows, cursorLine);
     if (cur) {
-      open({ kind: "row", id: cur.id, title: cur.id + " " + cur.desc });
+      open(rowTarget(cur));
       return;
     }
     // 没编号的行：只有光标停在上面才能交
     const lo = findRowAtLine(loose, cursorLine);
     if (lo) {
       const raw = text.split("\n")[lo.line];
-      open({ kind: "loose", id: "", title: "补充" + (lo.desc ? " " + lo.desc : ""), raw });
+      open({ kind: "loose", id: "", title: "补充" + (lo.desc ? " " + lo.desc : ""), raw, feedback: lo.feedback, used: isUsedRow(lo) });
       return;
     }
     if (duplicates.length) {
@@ -70,7 +89,7 @@ export default class PbcAttachPlugin extends Plugin {
     // 空的排前面，已有内容的排后面（sort 是稳定的，各自保持页面顺序）；「其他想说的」放最下面
     const items: Target[] = [...rows]
       .sort((a, b) => Number(b.empty) - Number(a.empty))
-      .map((r) => ({ kind: "row", id: r.id, title: r.id + " " + r.desc, done: !r.empty }) as Target & { done: boolean });
+      .map((r) => ({ ...rowTarget(r), done: !r.empty }) as Target & { done: boolean });
     if (other) items.push({ kind: "other", id: "", title: "其他想说的（随手写）" });
     new RowModal(this.app, items, open).open();
   }
@@ -149,6 +168,101 @@ export default class PbcAttachPlugin extends Plugin {
     }
   }
 
+  /** 给修改窗口用：文件名 → 能显示的图片地址（找不到就 null） */
+  private resourceFor(page: TFile) {
+    return (name: string): string | null => {
+      const f = this.app.metadataCache.getFirstLinkpathDest(name, page.path);
+      return f ? this.app.vault.getResourcePath(f) : null;
+    };
+  }
+
+  /**
+   * 换掉或删掉的旧文件放进 Obsidian 回收站（库里的 .trash 文件夹，能找回）。
+   * 只动附件文件夹里的；本页或别的页还引用着就不动。返回有没有放进回收站。
+   */
+  private async trashIfUnused(page: TFile, name: string, folder: string): Promise<boolean> {
+    const f = this.app.metadataCache.getFirstLinkpathDest(name, page.path);
+    if (!f || !f.path.startsWith(folder + "/")) return false;
+    if ((await this.app.vault.read(page)).includes(name)) return false;
+    const links = this.app.metadataCache.resolvedLinks;
+    for (const src in links) if (src !== page.path && links[src][f.path]) return false;
+    await this.app.vault.trash(f, false);
+    return true;
+  }
+
+  /** 改原来的：先存新图，再整格换掉（核对期间没被别处改过），最后把旧图放进回收站 */
+  private async saveEdit(page: TFile, target: Target, res: EditResult) {
+    if (target.kind === "other") return;
+    const folder = normalizePath(this.settings.attachFolder || DEFAULTS.attachFolder);
+    const created: TFile[] = []; // 这次新存的图：没保存成功时收回
+    const dropBack = async () => {
+      for (const f of created) await this.app.vault.trash(f, false).catch(() => undefined);
+    };
+    try {
+      let pieces = res.pieces.map((p) => ({ ...p }));
+      const oldNames: string[] = []; // 被换掉或删掉的文件，保存成功后放进回收站
+      let nText = 0, nSwap = 0, nDel = 0;
+      // 1. 新图先存进附件文件夹，名字和平常交的一样（编号-北京时间-序号）
+      if (res.replaced.size) {
+        await this.ensureFolder(folder);
+        const stamp = beijingStamp(Date.now());
+        const nameId = target.kind === "row" ? target.id : "补充";
+        const exists = (n: string) => this.app.vault.getAbstractFileByPath(folder + "/" + n) !== null;
+        let seq = 0;
+        for (const [i, f] of res.replaced) {
+          const name = uniqueName(imageName(nameId, stamp, ++seq, f.name), exists);
+          created.push(await this.app.vault.createBinary(folder + "/" + name, await f.arrayBuffer()));
+          pieces[i].raw = embedFor(name, true, true);
+          if (res.pieces[i].name) oldNames.push(res.pieces[i].name!);
+          nSwap++;
+        }
+      }
+      // 2. 改过的话：清空就当删掉
+      const removed = new Set(res.removed);
+      for (const [i, t] of res.texts) {
+        if (t.trim() === "") removed.add(i);
+        else { pieces[i].raw = escapeCellText(t.trim()); nText++; }
+      }
+      // 3. 删掉的块，从后往前删，序号不乱
+      for (const i of [...removed].sort((a, b) => b - a)) {
+        if (res.pieces[i].name && !res.replaced.has(i)) oldNames.push(res.pieces[i].name!);
+        pieces = removePiece(pieces, i);
+        nDel++;
+      }
+      const next = joinPieces(pieces);
+      // 4. 原子改文件：按编号 / 原文定位，期间被改过、刚被标成已用上、找不到，都不写
+      const where = target.kind === "row" ? { id: target.id } : { raw: target.raw };
+      let status = "missing";
+      await this.app.vault.process(page, (data) => {
+        const r = replaceCell(data, where, target.feedback, next);
+        status = r.status;
+        return r.text;
+      });
+      if (status !== "ok") {
+        await dropBack();
+        const why =
+          status === "changed" ? "这一行在你修改期间被别处改过（可能是别的设备同步过来的），"
+          : status === "used" ? "这一行刚被标成「已用上」，不能再改了，"
+          : "页面里找不到这一行了（可能被删或被改过），";
+        new Notice(why + "这次没保存。请重新打开这一页再改。", 15000);
+        return;
+      }
+      // 5. 旧文件放进回收站
+      let trashed = 0;
+      for (const n of oldNames) {
+        try { if (await this.trashIfUnused(page, n, folder)) trashed++; }
+        catch (e) { console.error("pbc-attach: 放进回收站失败", n, e); }
+      }
+      const did = [nText ? "改了 " + nText + " 段话" : "", nSwap ? "换了 " + nSwap + " 张图" : "", nDel ? "删了 " + nDel + " 项" : ""].filter(Boolean);
+      const label = target.kind === "row" ? target.id : "补充";
+      new Notice("已改好 " + label + "：" + did.join("、") + (trashed ? "。旧的 " + trashed + " 个文件放进了 Obsidian 回收站" : ""));
+    } catch (e) {
+      await dropBack();
+      console.error("pbc-attach", e);
+      new Notice("修改没成功：" + (e instanceof Error ? e.message : "出了点问题") + "。格子没动，请再试一次。");
+    }
+  }
+
   async saveSettings() {
     await this.saveData(this.settings);
   }
@@ -166,7 +280,7 @@ class RowModal extends SuggestModal<Target & { done?: boolean }> {
   }
   renderSuggestion(r: Target & { done?: boolean }, el: HTMLElement) {
     el.createDiv({ text: r.title });
-    if (r.done) el.createEl("small", { text: "已交过，可以再加" });
+    if (r.done) el.createEl("small", { text: "used" in r && r.used ? "已用上，可以再加，不能改" : "已交过，可以再加或改原来的" });
   }
   onChooseSuggestion(r: Target) {
     this.onPick(r);
@@ -176,7 +290,7 @@ class RowModal extends SuggestModal<Target & { done?: boolean }> {
 /** 写字窗口：一个输入框 + 「选截图 / 文件」+「只交这句话」+「取消」 */
 class PostModal extends Modal {
   private input: HTMLInputElement | null = null;
-  constructor(app: App, private target: Target, private onSubmit: (words: string, files: File[]) => void) {
+  constructor(app: App, private target: Target, private onSubmit: (words: string, files: File[]) => void, private onEdit?: () => void) {
     super(app);
   }
   onOpen() {
@@ -201,8 +315,24 @@ class PostModal extends Modal {
     });
     // 选择框被取消：什么都不做，窗口和文字都保留
 
+    // 这一行交过东西：没用上的可以「改原来的」；已用上的只提示一句
+    const t = this.target;
+    const editable = t.kind !== "other" && splitPieces(t.feedback).some((p) => p.kind !== "picked");
+    if (editable && t.used) {
+      const hint = contentEl.createEl("p", { text: "这一行已经用上了，不能改原来的；要补充就在上面写，再交一次。" });
+      hint.style.cssText = "font-size:var(--font-ui-small);color:var(--text-muted);margin:0 0 12px;";
+    }
+
     const bar = contentEl.createDiv();
     bar.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;";
+    if (editable && !t.used && this.onEdit) {
+      const fix = bar.createEl("button", { text: "改原来的" });
+      fix.style.marginRight = "auto"; // 放在最左边，和「交」的按钮分开
+      fix.addEventListener("click", () => {
+        this.close();
+        this.onEdit!();
+      });
+    }
     const cancel = bar.createEl("button", { text: "取消" });
     cancel.addEventListener("click", () => this.close());
     const textOnly = bar.createEl("button", { text: "只交这句话" });
@@ -223,6 +353,131 @@ class PostModal extends Modal {
   onClose() {
     this.input?.remove();
     this.input = null;
+    this.contentEl.empty();
+  }
+}
+
+/**
+ * 改原来的：把这一格拆成一块一块列出来。
+ * 话 → 输入框直接改（清空 = 删掉）；截图 → 换一张 / 删掉；还没取走的文件 → 删掉；已取走的 → 只能看。
+ */
+class EditModal extends Modal {
+  private inputs: HTMLInputElement[] = [];
+  private urls: string[] = []; // 新选图片的预览地址，关窗时释放
+  constructor(app: App, private target: Target, private resource: (name: string) => string | null, private onSave: (r: EditResult) => void) {
+    super(app);
+  }
+  onOpen() {
+    const { contentEl } = this;
+    contentEl.empty();
+    const t = this.target;
+    if (t.kind === "other") return;
+    this.setTitle("改：" + t.title);
+    const pieces = splitPieces(t.feedback);
+    const res: EditResult = { pieces, texts: new Map(), removed: new Set(), replaced: new Map() };
+
+    const tip = contentEl.createEl("p", { text: "话直接改，清空就是删掉这段；截图可以换一张或删掉。换下来的旧图会放进 Obsidian 回收站。" });
+    tip.style.cssText = "font-size:var(--font-ui-small);color:var(--text-muted);margin:0 0 12px;";
+
+    pieces.forEach((p, i) => {
+      const box = contentEl.createDiv();
+      box.style.cssText = "border:1px solid var(--background-modifier-border);border-radius:8px;padding:8px;margin-bottom:8px;";
+
+      if (p.kind === "text") {
+        const orig = unescapeCellText(p.raw);
+        const ta = box.createEl("textarea", { attr: { rows: String(Math.min(6, orig.split("\n").length + 1)) } });
+        ta.value = orig;
+        ta.style.cssText = "width:100%;";
+        ta.addEventListener("input", () => {
+          if (ta.value === orig) res.texts.delete(i);
+          else res.texts.set(i, ta.value);
+        });
+        return;
+      }
+      if (p.kind === "picked") {
+        box.createDiv({ text: unescapeCellText(p.raw) });
+        box.createEl("small", { text: "文件已经交给系统了，这里改不了；要换就再交一份新的。" });
+        box.style.opacity = "0.6";
+        return;
+      }
+
+      // 图片 / 还没取走的文件
+      const isImg = p.kind === "image";
+      let input: HTMLInputElement | null = null;
+      if (isImg) {
+        // 和交资料一样：input 提前建好、离屏，点按钮时同步 click()（iOS 才肯弹选择框）
+        input = contentEl.createEl("input", { attr: { type: "file", accept: "image/*" } });
+        input.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;";
+        this.inputs.push(input);
+      }
+      const draw = () => {
+        box.empty();
+        const removed = res.removed.has(i);
+        const newFile = res.replaced.get(i);
+        if (isImg) {
+          let src = this.resource(p.name!);
+          if (newFile) {
+            src = URL.createObjectURL(newFile);
+            this.urls.push(src);
+          }
+          if (src) {
+            const img = box.createEl("img", { attr: { src } });
+            img.style.cssText = "max-width:100%;max-height:180px;display:block;margin-bottom:6px;border-radius:4px;" + (removed ? "opacity:0.3;" : "");
+          } else box.createDiv({ text: "（这张图在库里没找到：" + p.name + "）" });
+        } else {
+          box.createDiv({ text: "📄 " + p.name }).style.opacity = removed ? "0.4" : "1";
+        }
+        const state = removed ? "保存后删掉" : newFile ? "保存后换成这张新图" : "";
+        if (state) box.createEl("small", { text: state }).style.cssText = "display:block;color:var(--text-accent);margin-bottom:6px;";
+
+        const bar = box.createDiv();
+        bar.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
+        if (isImg && !removed) {
+          const swap = bar.createEl("button", { text: newFile ? "再换一张" : "换一张" });
+          swap.addEventListener("click", () => {
+            input!.value = "";
+            input!.click(); // 同步 click，中间不能有 await
+          });
+          if (newFile) {
+            const undo = bar.createEl("button", { text: "不换了" });
+            undo.addEventListener("click", () => { res.replaced.delete(i); draw(); });
+          }
+        }
+        const del = bar.createEl("button", { text: removed ? "不删了" : "删掉" });
+        if (!removed) del.addClass("mod-warning");
+        del.addEventListener("click", () => {
+          if (removed) res.removed.delete(i);
+          else { res.removed.add(i); res.replaced.delete(i); }
+          draw();
+        });
+      };
+      input?.addEventListener("change", () => {
+        const f = input!.files?.[0];
+        if (!f) return; // 取消了选择框：什么都不变
+        res.replaced.set(i, f);
+        draw();
+      });
+      draw();
+    });
+
+    const bar = contentEl.createDiv();
+    bar.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:12px;";
+    bar.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
+    const save = bar.createEl("button", { text: "保存", cls: "mod-cta" });
+    save.addEventListener("click", () => {
+      if (!res.texts.size && !res.removed.size && !res.replaced.size) {
+        new Notice("没有改动。");
+        return;
+      }
+      this.close();
+      this.onSave(res);
+    });
+  }
+  onClose() {
+    this.inputs.forEach((x) => x.remove());
+    this.inputs = [];
+    this.urls.forEach((u) => URL.revokeObjectURL(u));
+    this.urls = [];
     this.contentEl.empty();
   }
 }

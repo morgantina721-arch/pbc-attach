@@ -9,6 +9,7 @@ export interface Row {
   desc: string; // 编号后面的短描述
   feedback: string; // 「我的反馈」格原文（去首尾空白）
   empty: boolean; // 反馈是否算空
+  note: string; // 反馈后面那一格（备注或建议）原文（去首尾空白）；没有这一格就是空串
   line: number; // 在文件里的行号（0 起；只用来对光标，写入时不用）
   // 以下两个是内部用的：反馈列的位置、多出来的格数（她打了没转义的 | 时）
   col: number;
@@ -106,10 +107,11 @@ export function parseRows(text: string): ParseResult {
     if (col < 0) continue; // 这张表没有「我的反馈」列
     const extra = Math.max(0, sp.segs.length - nCols);
     const feedback = sp.segs.slice(col, col + extra + 1).join("|").trim();
+    const note = (sp.segs[col + extra + 1] ?? "").trim();
     const m = ID_RE.exec(sp.segs[0].trim());
     if (!m) {
       // 没编号的行（她自己加的）：不进列表，只记下来给「光标在这一行」用
-      loose.push({ id: "", desc: sp.segs[0].trim(), feedback, empty: isEmptyFeedback(feedback), line: i, col, extra });
+      loose.push({ id: "", desc: sp.segs[0].trim(), feedback, note, empty: isEmptyFeedback(feedback), line: i, col, extra });
       continue;
     }
     if (seen.has(m[1])) {
@@ -117,7 +119,7 @@ export function parseRows(text: string): ParseResult {
       continue;
     }
     seen.add(m[1]);
-    rows.push({ id: m[1], desc: m[2].trim(), feedback, empty: isEmptyFeedback(feedback), line: i, col, extra });
+    rows.push({ id: m[1], desc: m[2].trim(), feedback, note, empty: isEmptyFeedback(feedback), line: i, col, extra });
   }
   return { rows, duplicates: dup, loose };
 }
@@ -294,4 +296,123 @@ export function summarize(images: number, others: number): string {
   if (images) parts.push(`${images} 张图片`);
   if (others) parts.push(`${others} 个文件`);
   return parts.join("、");
+}
+
+// ---------- 改原来的 ----------
+
+/** 这一行已经用上了（备注格以 ✅ 开头，如「✅ 已用上」）：不让改 */
+export function isUsedRow(row: Pick<Row, "note">): boolean {
+  return row.note.startsWith("✅");
+}
+
+/**
+ * 格子里的一块内容：
+ * - text：一段话（raw 是格子里的原文，带 <br> 和 \|）
+ * - image / file：一个嵌入 ![[名]]，name 是文件名（去掉 |300 这类尺寸）
+ * - picked：系统写的「✅ 已取走：名（MM-DD）」，只能看不能改
+ * sep：这一块和前一块之间原来的分隔（空格、<br>），重建时原样放回去
+ */
+export interface Piece {
+  kind: "text" | "image" | "file" | "picked";
+  raw: string;
+  sep: string;
+  name?: string;
+}
+
+const PICKED_RE = /✅ 已取走：.*?（\d{2}-\d{2}）/;
+const EMBED_RE = /!\[\[([^\]]*)\]\]/;
+const TOKEN_RE = new RegExp(EMBED_RE.source + "|" + PICKED_RE.source, "g");
+const GAP_RE = /^(?:\s|<br\s*\/?>|&nbsp;)*/i; // 空白、<br>、&nbsp; 都算分隔
+
+/** 嵌入里的文件名：![[A04-1.png\|300]] → A04-1.png；![[a.xlsx#x]] → a.xlsx */
+export function embedName(inner: string): string {
+  return inner.split(/\\?\|/)[0].split("#")[0].trim();
+}
+
+/** 把「我的反馈」格拆成一块一块（按原来的顺序） */
+export function splitPieces(feedback: string): Piece[] {
+  const out: Piece[] = [];
+  let pending = ""; // 还没归属的分隔
+  const pushText = (run: string) => {
+    const lead = GAP_RE.exec(run)![0];
+    const rest = run.slice(lead.length);
+    // 尾部分隔：从尾部匹配空白、<br>、&nbsp;
+    const tail = /(?:\s|<br\s*\/?>|&nbsp;)*$/i.exec(rest)![0];
+    const core = rest.slice(0, rest.length - tail.length);
+    if (core === "") { pending += run; return; }
+    out.push({ kind: "text", raw: core, sep: pending + lead });
+    pending = tail;
+  };
+  let last = 0;
+  for (const m of feedback.matchAll(TOKEN_RE)) {
+    pushText(feedback.slice(last, m.index));
+    if (m[1] !== undefined) {
+      const name = embedName(m[1]);
+      out.push({ kind: isImageFile(name, "") ? "image" : "file", raw: m[0], sep: pending, name });
+    } else {
+      out.push({ kind: "picked", raw: m[0], sep: pending });
+    }
+    pending = "";
+    last = m.index! + m[0].length;
+  }
+  pushText(feedback.slice(last));
+  return out;
+}
+
+/** 把一块块拼回格子内容。第一块不带分隔；两段话之间原来没分隔时补一个空格，免得粘在一起。 */
+export function joinPieces(pieces: Piece[]): string {
+  return pieces
+    .map((p, i) => {
+      if (i === 0) return p.raw;
+      const sep = p.sep === "" && p.kind === "text" && pieces[i - 1].kind === "text" ? " " : p.sep;
+      return sep + p.raw;
+    })
+    .join("");
+}
+
+/** 格子原文 → 输入框里显示的字：<br> → 换行，\| → | */
+export function unescapeCellText(s: string): string {
+  return s.replace(/<br\s*\/?>/gi, "\n").replace(/\\\|/g, "|");
+}
+
+/** 删掉第 i 块：它后面那块如果原来紧贴着（没分隔），就接过它的分隔 */
+export function removePiece(pieces: Piece[], i: number): Piece[] {
+  const out = pieces.map((p) => ({ ...p }));
+  const [gone] = out.splice(i, 1);
+  if (out[i] && out[i].sep === "") out[i].sep = gone.sep;
+  return out;
+}
+
+export type ReplaceStatus = "ok" | "missing" | "changed" | "used";
+
+/**
+ * 把某一行「我的反馈」整格换成 next（只有她点了「改原来的」并保存时才用）。
+ * 定位：编号行按编号；没编号的行按打开窗口时这一行的原文（必须恰好一处）。
+ * 保护：现在格子里的内容和打开窗口时的 expected 不一样（期间别处改过）→ changed，不写；
+ *       这一行已经用上了 → used，不写；找不到 → missing。只动这一格，其他格、其他行一字不动。
+ */
+export function replaceCell(
+  text: string,
+  where: { id: string } | { raw: string },
+  expected: string,
+  next: string,
+): { text: string; status: ReplaceStatus } {
+  const parsed = parseRows(text);
+  const lines = text.split("\n");
+  let row: Row | undefined;
+  if ("id" in where) {
+    row = parsed.rows.find((r) => r.id === where.id);
+  } else {
+    if (lines.filter((l) => l === where.raw).length !== 1) return { text, status: "missing" };
+    row = parsed.loose.find((r) => lines[r.line] === where.raw);
+  }
+  if (!row) return { text, status: "missing" };
+  if (isUsedRow(row)) return { text, status: "used" };
+  if (row.feedback !== expected.trim()) return { text, status: "changed" };
+  const sp = splitLine(lines[row.line])!;
+  while (sp.segs.length <= row.col) sp.segs.push("");
+  const t = next.trim();
+  sp.segs.splice(row.col, row.extra + 1, t === "" ? " " : " " + t + " ");
+  lines[row.line] = joinLine(sp);
+  return { text: lines.join("\n"), status: "ok" };
 }

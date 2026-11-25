@@ -4,6 +4,7 @@ import {
   parseRows, findRowAtLine, appendToCell, sanitizeFileName, imageName, uniqueName,
   beijingStamp, embedFor, isImageFile, summarize,
   escapeCellText, composeCell, composeOther, appendToLooseLine, appendToOther, hasOtherSection, isPbcPagePath,
+  isUsedRow, splitPieces, joinPieces, removePiece, unescapeCellText, embedName, replaceCell,
 } from "../src/pbc";
 
 // 全部是编造的样例
@@ -241,4 +242,92 @@ test("页面判定：顶层 PBC-*、-细节、归档子文件夹、别的文件�
   assert.ok(!isPbcPagePath(f, "财务/PBC", "说明.md"));
   assert.ok(!isPbcPagePath(f, "财务/PBC", "PBC-2026-11-23.txt"));
   assert.ok(!isPbcPagePath(f, undefined, "PBC-a.md"));
+});
+
+// ---------- 改原来的 ----------
+
+const EDIT_PAGE = [
+  "| 要什么 | 我的反馈 | 备注 |",
+  "|---|---|---|",
+  "| A01 假流水 | 第一句<br>第二句 ![[A01-20261124-223000-1.png\\|300]] ![[A01-20261124-223000-2.png\\|300]] | ⏳ 系统在处理（不用你管） |",
+  "| A02 假账单 | 补一份：✅ 已取走：假账单.xlsx（11-24）<br>![[还没取.csv]] | ❓ 要你补一句：请补截图 |",
+  "| A03 已用过 | ![[A03-1.png\\|300]] | ✅ 已用上 |",
+  "| 她加的一行 | 随手写 | |",
+].join("\n");
+
+test("改：备注读得到，✅ 开头算已用上", () => {
+  const { rows, loose } = parseRows(EDIT_PAGE);
+  assert.equal(rows[0].note, "⏳ 系统在处理（不用你管）");
+  assert.deepEqual(rows.map(isUsedRow), [false, false, true]);
+  assert.equal(loose[0].note, "");
+  assert.equal(isUsedRow(loose[0]), false);
+});
+
+test("改：格子拆成一块一块，拼回去一字不差", () => {
+  const { rows } = parseRows(EDIT_PAGE);
+  const p1 = splitPieces(rows[0].feedback);
+  assert.deepEqual(p1.map((p) => p.kind), ["text", "image", "image"]);
+  assert.equal(p1[0].raw, "第一句<br>第二句");
+  assert.equal(p1[1].name, "A01-20261124-223000-1.png");
+  assert.equal(p1[1].sep, " ");
+  assert.equal(joinPieces(p1), rows[0].feedback);
+  const p2 = splitPieces(rows[1].feedback);
+  assert.deepEqual(p2.map((p) => p.kind), ["text", "picked", "file"]);
+  assert.equal(p2[1].sep, "");
+  assert.equal(p2[2].sep, "<br>");
+  assert.equal(p2[2].name, "还没取.csv");
+  assert.equal(joinPieces(p2), rows[1].feedback);
+  // 前后多余的空白和 <br> 不算一块
+  assert.deepEqual(splitPieces("<br> 话 <br>").map((p) => p.raw), ["话"]);
+  assert.deepEqual(splitPieces(""), []);
+  assert.deepEqual(splitPieces("<br>&nbsp;"), []);
+});
+
+test("改：嵌入名、转义还原", () => {
+  assert.equal(embedName("A04-1.png\\|300"), "A04-1.png");
+  assert.equal(embedName("A04-1.png|300"), "A04-1.png");
+  assert.equal(embedName("a.xlsx"), "a.xlsx");
+  assert.equal(unescapeCellText("一<br>二 a\\|b"), "一\n二 a|b");
+  assert.equal(escapeCellText(unescapeCellText("一<br>二 a\\|b")), "一<br>二 a\\|b");
+});
+
+test("改：删掉一块，后面紧贴的那块接过分隔", () => {
+  const { rows } = parseRows(EDIT_PAGE);
+  const p = splitPieces(rows[0].feedback);
+  assert.equal(joinPieces(removePiece(p, 1)), "第一句<br>第二句 ![[A01-20261124-223000-2.png\\|300]]");
+  assert.equal(joinPieces(removePiece(p, 0)), "![[A01-20261124-223000-1.png\\|300]] ![[A01-20261124-223000-2.png\\|300]]");
+  const q = splitPieces(rows[1].feedback);
+  assert.equal(joinPieces(removePiece(q, 0)), "✅ 已取走：假账单.xlsx（11-24）<br>![[还没取.csv]]");
+  // 两段话中间那块删了、原来没分隔：补空格不粘在一起
+  const r = splitPieces("前![[x.png]]后");
+  assert.equal(joinPieces(removePiece(r, 1)), "前 后");
+});
+
+test("改：整格替换只动这一格；别处改过 / 已用上 / 找不到都不写", () => {
+  const { rows } = parseRows(EDIT_PAGE);
+  const ok = replaceCell(EDIT_PAGE, { id: "A01" }, rows[0].feedback, "新的话");
+  assert.equal(ok.status, "ok");
+  const before = EDIT_PAGE.split("\n"), after = ok.text.split("\n");
+  assert.equal(after[2], "| A01 假流水 | 新的话 | ⏳ 系统在处理（不用你管） |");
+  after.forEach((l, i) => { if (i !== 2) assert.equal(l, before[i]); });
+  // 清空
+  assert.ok(replaceCell(EDIT_PAGE, { id: "A01" }, rows[0].feedback, "").text.includes("| A01 假流水 | | ⏳"));
+  // 期间别处改过
+  const r1 = replaceCell(EDIT_PAGE, { id: "A01" }, "打开时的旧内容", "新的话");
+  assert.equal(r1.status, "changed");
+  assert.equal(r1.text, EDIT_PAGE);
+  // 已用上
+  const r2 = replaceCell(EDIT_PAGE, { id: "A03" }, rows[2].feedback, "x");
+  assert.equal(r2.status, "used");
+  assert.equal(r2.text, EDIT_PAGE);
+  // 找不到
+  assert.equal(replaceCell(EDIT_PAGE, { id: "A09" }, "", "x").status, "missing");
+});
+
+test("改：没编号的行按原文定位", () => {
+  const raw = "| 她加的一行 | 随手写 | |";
+  const ok = replaceCell(EDIT_PAGE, { raw }, "随手写", "改过的");
+  assert.equal(ok.status, "ok");
+  assert.ok(ok.text.includes("| 她加的一行 | 改过的 | |"));
+  assert.equal(replaceCell(EDIT_PAGE, { raw: "| 她加的一行 | 别的 | |" }, "别的", "x").status, "missing");
 });
