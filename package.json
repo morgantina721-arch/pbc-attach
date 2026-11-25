@@ -1,6 +1,6 @@
 {
   "name": "pbc-attach",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "PBC 交资料：把截图和文件交到 PBC 清单的「我的反馈」格子里",
   "main": "main.js",
   "private": true,

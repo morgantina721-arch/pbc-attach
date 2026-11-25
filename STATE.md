@@ -1,6 +1,6 @@
 # STATE
 
-更新：2026-11-25 20:15（北京时间）
+更新：2026-11-25 20:25（北京时间）
 
 ## 已定
 - 命令「PBC：交资料」+ 左侧 paperclip 图标；isDesktopOnly: false。
@@ -24,6 +24,10 @@
 - 备注以 ✅ 开头算已用上：没有按钮，只提示「再交一次」；选行列表标「已用上，可以再加，不能改」。
 - 纯函数：splitPieces / joinPieces / removePiece / unescapeCellText / replaceCell / isUsedRow；Row 加 note。测试 31 个全过；npm run build 过。
 - 记账程序不用改：pbc-pickup 不碰图片；被删的没取走文件已进 .trash（pickup 不看点开头的文件夹，附件夹孤儿也不会再有它）。
+
+## 0.3.1（用户 2026-11-25 真机反馈：换图能弹相册，但不能多选；会被输入法挡住）
+- 「换成别的图」可多选：一张旧图换成几张，新图依次排在原位置。
+- 躲输入法：fitAboveKeyboard 按 visualViewport 把窗口外层框到可见区域，窗口限高可滚动，点输入框滚到中间；修改窗口按钮条 sticky 贴底。交资料小窗也用上。未在真机验证。
 
 ## 待定
 - 真机验证：iOS 在写字窗口里点「选截图 / 文件」能否弹出选择框（input 在窗口打开时已建好，点击里只同步 click）。

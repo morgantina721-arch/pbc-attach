@@ -31,7 +31,7 @@ interface EditResult {
   pieces: Piece[]; // 打开时拆出来的原样
   texts: Map<number, string>; // 改过的话：块序号 → 输入框里的新字（未转义）
   removed: Set<number>; // 要删掉的块
-  replaced: Map<number, File>; // 要换的图：块序号 → 新选的图片
+  replaced: Map<number, File[]>; // 要换的图：块序号 → 新选的图片（可以一张换成几张）
 }
 
 export default class PbcAttachPlugin extends Plugin {
@@ -209,10 +209,15 @@ export default class PbcAttachPlugin extends Plugin {
         const nameId = target.kind === "row" ? target.id : "补充";
         const exists = (n: string) => this.app.vault.getAbstractFileByPath(folder + "/" + n) !== null;
         let seq = 0;
-        for (const [i, f] of res.replaced) {
-          const name = uniqueName(imageName(nameId, stamp, ++seq, f.name), exists);
-          created.push(await this.app.vault.createBinary(folder + "/" + name, await f.arrayBuffer()));
-          pieces[i].raw = embedFor(name, true, true);
+        for (const [i, fs] of res.replaced) {
+          // 一张旧图可以换成几张新图：新图依次排在旧图原来的位置，用空格隔开
+          const embeds: string[] = [];
+          for (const f of fs) {
+            const name = uniqueName(imageName(nameId, stamp, ++seq, f.name), exists);
+            created.push(await this.app.vault.createBinary(folder + "/" + name, await f.arrayBuffer()));
+            embeds.push(embedFor(name, true, true));
+          }
+          pieces[i].raw = embeds.join(" ");
           if (res.pieces[i].name) oldNames.push(res.pieces[i].name!);
           nSwap++;
         }
@@ -268,6 +273,39 @@ export default class PbcAttachPlugin extends Plugin {
   }
 }
 
+/**
+ * 手机上让窗口躲开输入法：
+ * 输入法弹出时，可见区域（visualViewport）变矮。把窗口外层框到可见区域里，窗口最高不超过可见高度、超出的部分可以滚动；
+ * 点进输入框时把它滚到中间。返回一个函数，关窗时调用，撤掉这些设置。
+ */
+function fitAboveKeyboard(modal: Modal): () => void {
+  const vv = window.visualViewport;
+  const box = modal.containerEl; // 盖住整个屏幕的外层
+  const win = modal.modalEl; // 窗口本身
+  win.style.overflowY = "auto";
+  const fit = () => {
+    if (!vv) return;
+    box.style.top = vv.offsetTop + "px";
+    box.style.height = vv.height + "px";
+    box.style.bottom = "auto";
+    win.style.maxHeight = Math.max(200, vv.height - 16) + "px";
+  };
+  const onFocus = (e: FocusEvent) => {
+    const t = e.target as HTMLElement | null;
+    // 等输入法弹完（iOS 大约 300 毫秒）再滚
+    if (t && (t.tagName === "TEXTAREA" || t.tagName === "INPUT")) setTimeout(() => t.scrollIntoView({ block: "center" }), 350);
+  };
+  vv?.addEventListener("resize", fit);
+  vv?.addEventListener("scroll", fit);
+  win.addEventListener("focusin", onFocus);
+  fit();
+  return () => {
+    vv?.removeEventListener("resize", fit);
+    vv?.removeEventListener("scroll", fit);
+    win.removeEventListener("focusin", onFocus);
+  };
+}
+
 /** 没有光标行时，列出所有编号行（和「其他想说的」）让她选 */
 class RowModal extends SuggestModal<Target & { done?: boolean }> {
   constructor(app: App, private items: (Target & { done?: boolean })[], private onPick: (t: Target) => void) {
@@ -290,6 +328,7 @@ class RowModal extends SuggestModal<Target & { done?: boolean }> {
 /** 写字窗口：一个输入框 + 「选截图 / 文件」+「只交这句话」+「取消」 */
 class PostModal extends Modal {
   private input: HTMLInputElement | null = null;
+  private unfit: (() => void) | null = null;
   constructor(app: App, private target: Target, private onSubmit: (words: string, files: File[]) => void, private onEdit?: () => void) {
     super(app);
   }
@@ -297,6 +336,7 @@ class PostModal extends Modal {
     const { contentEl } = this;
     contentEl.empty();
     this.setTitle("交到：" + this.target.title);
+    this.unfit = fitAboveKeyboard(this);
     const ta = contentEl.createEl("textarea", { attr: { placeholder: "想说的话（可以不填）", rows: "5" } });
     ta.style.cssText = "width:100%;margin-bottom:12px;";
 
@@ -351,6 +391,8 @@ class PostModal extends Modal {
     });
   }
   onClose() {
+    this.unfit?.();
+    this.unfit = null;
     this.input?.remove();
     this.input = null;
     this.contentEl.empty();
@@ -364,6 +406,7 @@ class PostModal extends Modal {
 class EditModal extends Modal {
   private inputs: HTMLInputElement[] = [];
   private urls: string[] = []; // 新选图片的预览地址，关窗时释放
+  private unfit: (() => void) | null = null;
   constructor(app: App, private target: Target, private resource: (name: string) => string | null, private onSave: (r: EditResult) => void) {
     super(app);
   }
@@ -373,6 +416,7 @@ class EditModal extends Modal {
     const t = this.target;
     if (t.kind === "other") return;
     this.setTitle("改：" + t.title);
+    this.unfit = fitAboveKeyboard(this);
     const pieces = splitPieces(t.feedback);
     const res: EditResult = { pieces, texts: new Map(), removed: new Set(), replaced: new Map() };
 
@@ -406,34 +450,38 @@ class EditModal extends Modal {
       let input: HTMLInputElement | null = null;
       if (isImg) {
         // 和交资料一样：input 提前建好、离屏，点按钮时同步 click()（iOS 才肯弹选择框）
-        input = contentEl.createEl("input", { attr: { type: "file", accept: "image/*" } });
+        input = contentEl.createEl("input", { attr: { type: "file", accept: "image/*", multiple: "" } });
         input.style.cssText = "position:fixed;left:-9999px;top:0;width:1px;height:1px;opacity:0;";
         this.inputs.push(input);
       }
       const draw = () => {
         box.empty();
         const removed = res.removed.has(i);
-        const newFile = res.replaced.get(i);
+        const newFiles = res.replaced.get(i);
+        const newFile = newFiles?.length ? newFiles : undefined;
         if (isImg) {
-          let src = this.resource(p.name!);
-          if (newFile) {
-            src = URL.createObjectURL(newFile);
-            this.urls.push(src);
+          // 换了就显示新选的几张，否则显示原图
+          const srcs: (string | null)[] = newFile
+            ? newFile.map((f) => { const u = URL.createObjectURL(f); this.urls.push(u); return u; })
+            : [this.resource(p.name!)];
+          const row = box.createDiv();
+          row.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;margin-bottom:6px;";
+          for (const src of srcs) {
+            if (src) {
+              const img = row.createEl("img", { attr: { src } });
+              img.style.cssText = "max-width:" + (srcs.length > 1 ? "48%" : "100%") + ";max-height:180px;border-radius:4px;" + (removed ? "opacity:0.3;" : "");
+            } else row.createDiv({ text: "（这张图在库里没找到：" + p.name + "）" });
           }
-          if (src) {
-            const img = box.createEl("img", { attr: { src } });
-            img.style.cssText = "max-width:100%;max-height:180px;display:block;margin-bottom:6px;border-radius:4px;" + (removed ? "opacity:0.3;" : "");
-          } else box.createDiv({ text: "（这张图在库里没找到：" + p.name + "）" });
         } else {
           box.createDiv({ text: "📄 " + p.name }).style.opacity = removed ? "0.4" : "1";
         }
-        const state = removed ? "保存后删掉" : newFile ? "保存后换成这张新图" : "";
+        const state = removed ? "保存后删掉" : newFile ? (newFile.length > 1 ? "保存后换成这 " + newFile.length + " 张新图" : "保存后换成这张新图") : "";
         if (state) box.createEl("small", { text: state }).style.cssText = "display:block;color:var(--text-accent);margin-bottom:6px;";
 
         const bar = box.createDiv();
         bar.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;";
         if (isImg && !removed) {
-          const swap = bar.createEl("button", { text: newFile ? "再换一张" : "换一张" });
+          const swap = bar.createEl("button", { text: newFile ? "重新选" : "换成别的图" });
           swap.addEventListener("click", () => {
             input!.value = "";
             input!.click(); // 同步 click，中间不能有 await
@@ -452,16 +500,17 @@ class EditModal extends Modal {
         });
       };
       input?.addEventListener("change", () => {
-        const f = input!.files?.[0];
-        if (!f) return; // 取消了选择框：什么都不变
-        res.replaced.set(i, f);
+        const fs = Array.from(input!.files ?? []);
+        if (!fs.length) return; // 取消了选择框：什么都不变
+        res.replaced.set(i, fs);
         draw();
       });
       draw();
     });
 
     const bar = contentEl.createDiv();
-    bar.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:12px;";
+    // 按钮条贴在窗口底部：内容长、要滚动时也一直看得到「保存」
+    bar.style.cssText = "display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;margin-top:12px;padding:8px 0;position:sticky;bottom:0;background:var(--background-primary);";
     bar.createEl("button", { text: "取消" }).addEventListener("click", () => this.close());
     const save = bar.createEl("button", { text: "保存", cls: "mod-cta" });
     save.addEventListener("click", () => {
@@ -474,6 +523,8 @@ class EditModal extends Modal {
     });
   }
   onClose() {
+    this.unfit?.();
+    this.unfit = null;
     this.inputs.forEach((x) => x.remove());
     this.inputs = [];
     this.urls.forEach((u) => URL.revokeObjectURL(u));
